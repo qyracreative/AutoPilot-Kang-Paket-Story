@@ -196,7 +196,7 @@ export default function App() {
   const [gasUrl, setGasUrl] = useState(
     (import.meta as any).env?.VITE_GOOGLE_APPS_SCRIPT_URL ||
     localStorage.getItem('gas_url') || 
-    "https://script.google.com/macros/s/AKfycbxVnHwT0cMLBOJqBfuPiBI1rpuv6sHrGRNW6R0CLwptLG9i0cmnH_acgllLAi0xbZBI/exec"
+    "https://script.google.com/macros/s/AKfycbxVnHwT0cMLBOJqBfuPiBI1rpuv6sHrGRNW6R0CLwptLG9i0cmnH_acgllLAi0xbZBI/exec?action=getQueue&sheet=Story"
   );
   const [gasCopied, setGasCopied] = useState(false);
   const [isAutopilotActive, setIsAutopilotActive] = useState(localStorage.getItem('autopilot_active') === 'true');
@@ -267,12 +267,12 @@ export default function App() {
 
     try {
       setAutopilotStatus("Mencari antrian...");
-      const requestUrl = getRequestUrl("/api/gas-proxy", { action: "getQueue" });
+      const requestUrl = getRequestUrl("/api/gas-proxy", { 
+        action: "getQueue",
+        targetUrl: trimmedUrl 
+      });
       const res = await fetch(requestUrl, {
-        method: "GET",
-        headers: {
-          "x-gas-url": trimmedUrl
-        }
+        method: "GET"
       });
       
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -301,7 +301,7 @@ export default function App() {
       console.error("Queue fetch failed:", err);
       // Detailed error for GAS issues
       if (err.message.includes("Failed to fetch")) {
-        setAutopilotStatus("Koneksi Blokir! Pastikan GAS dideploy: 'Anyone' & tipe 'Web App'.");
+        setAutopilotStatus("Gagal terkoneksi ke Proxy server. Coba muat ulang aplikasi.");
       } else {
         setAutopilotStatus(`Error: ${err.message}`);
       }
@@ -319,17 +319,21 @@ export default function App() {
         action: "updateStatus",
         status: status,
         rowIndex: rowIndex,
-        cb: timestamp
+        cb: timestamp,
+        targetUrl: trimmedUrl
       });
-      await fetch(requestUrl, {
-        method: "GET",
-        headers: {
-          "x-gas-url": trimmedUrl
-        }
+      const res = await fetch(requestUrl, {
+        method: "GET"
       });
+      const text = await res.text();
+      console.log(`Status update response: ${text}`);
+      if (text.includes("Error:") || text.includes("not found")) {
+        throw new Error(text.trim());
+      }
       console.log(`Status update requested: ${status} for row ${rowIndex}`);
-    } catch (e) {
+    } catch (e: any) {
       console.error("Update status failed", e);
+      throw e;
     }
   };
 
@@ -348,29 +352,37 @@ export default function App() {
     const fullPromptText = getFullPromptText(prompt);
 
     try {
-      // Create a plain object for the payload
-      // GAS e.parameter works best with application/x-www-form-urlencoded
-      const body = new URLSearchParams();
-      body.append("action", "updateResults");
-      body.append("rowIndex", rowIndex.toString());
-      body.append("fullPrompt", fullPromptText);
-      body.append("facebook", fbContent);
-      body.append("ytTitle", prompt.socialMedia.youtube.title || "");
-      body.append("ytDesc", prompt.socialMedia.youtube.description || "");
-      body.append("ytHashtags", ytHashtags);
-      body.append("tiktok", ttContent);
-
-      await fetch("/api/gas-proxy", {
+      // Send as a JSON payload to our proxy
+      const res = await fetch("/api/gas-proxy", {
         method: "POST",
         headers: {
-          "x-gas-url": trimmedUrl
+          "Content-Type": "application/json"
         },
-        body: body
+        body: JSON.stringify({
+          targetUrl: trimmedUrl,
+          action: "updateResults",
+          rowIndex: rowIndex.toString(),
+          fullPrompt: fullPromptText,
+          facebook: fbContent,
+          ytTitle: prompt.socialMedia.youtube.title || "",
+          ytDesc: prompt.socialMedia.youtube.description || "",
+          ytHashtags: ytHashtags,
+          tiktok: ttContent
+        })
       });
       
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      
+      const text = await res.text();
+      console.log("Upload results response:", text);
+      if (text.includes("Error:") || text.includes("not found")) {
+        throw new Error(text.trim());
+      }
+      
       console.log("Upload results requested for row:", rowIndex);
-    } catch (e) {
+    } catch (e: any) {
       console.error("Upload results failed", e);
+      throw e;
     }
   };
 
@@ -441,9 +453,9 @@ export default function App() {
         // Loop directly instead of full reload to prevent UI flicker and maintain state
         runCycle();
 
-      } catch (err) {
+      } catch (err: any) {
         console.error("Autopilot cycle failed:", err);
-        setAutopilotStatus("Error di siklus. Mengulang dalam 15 detik...");
+        setAutopilotStatus(`Gagal: ${err.message || err}. Mengulang dalam 15 detik...`);
         setCountdown(15);
         timer = setTimeout(runCycle, 15000);
       }
