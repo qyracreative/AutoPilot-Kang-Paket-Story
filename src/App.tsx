@@ -193,7 +193,11 @@ export default function App() {
   const jakartaTime = formatJakartaTime(currentTime);
 
   // --- Autopilot States ---
-  const [gasUrl, setGasUrl] = useState(localStorage.getItem('gas_url') || "");
+  const [gasUrl, setGasUrl] = useState(
+    (import.meta as any).env?.VITE_GOOGLE_APPS_SCRIPT_URL ||
+    localStorage.getItem('gas_url') || 
+    "https://script.google.com/macros/s/AKfycbxVnHwT0cMLBOJqBfuPiBI1rpuv6sHrGRNW6R0CLwptLG9i0cmnH_acgllLAi0xbZBI/exec"
+  );
   const [gasCopied, setGasCopied] = useState(false);
   const [isAutopilotActive, setIsAutopilotActive] = useState(localStorage.getItem('autopilot_active') === 'true');
   const [autopilotStatus, setAutopilotStatus] = useState("Idle");
@@ -210,6 +214,45 @@ export default function App() {
 
   // --- Autopilot Logic Functions ---
 
+  const getRequestUrl = (baseUrl: string, extraParams: Record<string, any>) => {
+    try {
+      const urlObj = new URL(baseUrl.trim());
+      // Set the extra parameters, overwriting any existing ones
+      Object.keys(extraParams).forEach((key) => {
+        urlObj.searchParams.set(key, String(extraParams[key]));
+      });
+      return urlObj.toString();
+    } catch (e) {
+      // Fallback if URL constructor fails
+      let trimmed = baseUrl.trim();
+      const questionIndex = trimmed.indexOf("?");
+      let urlBase = trimmed;
+      const queryParams: Record<string, string> = {};
+
+      if (questionIndex !== -1) {
+        urlBase = trimmed.substring(0, questionIndex);
+        const search = trimmed.substring(questionIndex + 1);
+        search.split("&").forEach((part) => {
+          const [key, val] = part.split("=");
+          if (key) {
+            queryParams[decodeURIComponent(key)] = val ? decodeURIComponent(val) : "";
+          }
+        });
+      }
+
+      // Merge params
+      const merged = { ...queryParams, ...extraParams };
+      let finalUrl = urlBase;
+      let isFirst = true;
+      Object.keys(merged).forEach((key) => {
+        const prefix = isFirst ? "?" : "&";
+        finalUrl += `${prefix}${encodeURIComponent(key)}=${encodeURIComponent(merged[key])}`;
+        isFirst = false;
+      });
+      return finalUrl;
+    }
+  };
+
   const fetchQueue = async () => {
     const trimmedUrl = gasUrl.trim();
     if (!trimmedUrl) {
@@ -224,14 +267,28 @@ export default function App() {
 
     try {
       setAutopilotStatus("Mencari antrian...");
-      const res = await fetch(`${trimmedUrl}?action=getQueue`, {
+      const requestUrl = getRequestUrl("/api/gas-proxy", { action: "getQueue" });
+      const res = await fetch(requestUrl, {
         method: "GET",
-        mode: "cors",
+        headers: {
+          "x-gas-url": trimmedUrl
+        }
       });
       
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       
-      const item = await res.json();
+      const text = await res.text();
+      if (text.trim().startsWith("Error:")) {
+        throw new Error(text.trim());
+      }
+
+      let item;
+      try {
+        item = JSON.parse(text);
+      } catch (e) {
+        throw new Error(`Response bukan JSON: ${text.slice(0, 80)}`);
+      }
+
       if (item && item.rowIndex) {
         setCurrentQueueItem(item);
         setCourier(item.courier);
@@ -242,7 +299,7 @@ export default function App() {
       return item;
     } catch (err: any) {
       console.error("Queue fetch failed:", err);
-      // Detailed error for common GAS issues
+      // Detailed error for GAS issues
       if (err.message.includes("Failed to fetch")) {
         setAutopilotStatus("Koneksi Blokir! Pastikan GAS dideploy: 'Anyone' & tipe 'Web App'.");
       } else {
@@ -257,10 +314,18 @@ export default function App() {
     if (!trimmedUrl) return;
     try {
       const timestamp = new Date().getTime();
-      // Use GET for status updates with cache buster
-      await fetch(`${trimmedUrl}?action=updateStatus&status=${status}&rowIndex=${rowIndex}&cb=${timestamp}`, {
+      // Use GET for status updates with cache buster through proxy
+      const requestUrl = getRequestUrl("/api/gas-proxy", {
+        action: "updateStatus",
+        status: status,
+        rowIndex: rowIndex,
+        cb: timestamp
+      });
+      await fetch(requestUrl, {
         method: "GET",
-        mode: "no-cors"
+        headers: {
+          "x-gas-url": trimmedUrl
+        }
       });
       console.log(`Status update requested: ${status} for row ${rowIndex}`);
     } catch (e) {
@@ -295,10 +360,11 @@ export default function App() {
       body.append("ytHashtags", ytHashtags);
       body.append("tiktok", ttContent);
 
-      // We send it to doPost (via method: POST)
-      await fetch(trimmedUrl, {
+      await fetch("/api/gas-proxy", {
         method: "POST",
-        mode: "no-cors",
+        headers: {
+          "x-gas-url": trimmedUrl
+        },
         body: body
       });
       
@@ -984,112 +1050,6 @@ export default function App() {
             </div>
 
             <div className="grid grid-cols-1 gap-2">
-              <div className="flex gap-2">
-                <Input 
-                  placeholder="Apps Script URL (dengan /exec)" 
-                  value={gasUrl}
-                  onChange={(e) => setGasUrl(e.target.value)}
-                  className="h-10 text-xs bg-black/40 border-orange-500/30 text-orange-200 placeholder:text-orange-900 focus-visible:ring-orange-500"
-                />
-                <Button
-                  variant="outline"
-                  onClick={() => {
-                    const code = `function doGet(e) {
-  const p = e.parameter;
-  const action = p.action;
-  const sheetName = "Story";
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const sheet = ss.getSheetByName(sheetName);
-  
-  if (!sheet) {
-    return ContentService.createTextOutput(JSON.stringify({ error: "Sheet " + sheetName + " tidak ditemukan" }))
-      .setMimeType(ContentService.MimeType.JSON);
-  }
-  
-  if (action === "getQueue") {
-    const data = sheet.getDataRange().getValues();
-    for (let i = 1; i < data.length; i++) {
-      if (data[i][29] === "Queue") {
-        const row = data[i];
-        return ContentService.createTextOutput(JSON.stringify({
-          rowIndex: i + 1,
-          courier: { name: row[1], type: row[2], visual: row[3], personality: row[4], traits: row[5], characteristic: row[6], vibe: row[7], outfit: row[8], vehicle: row[9] },
-          recipient: { name: row[12], type: row[13], visual: row[14], personality: row[15], traits: row[16], characteristic: row[17], vibe: row[18], outfit: row[19], location: row[20], package: row[21], reaction: row[22] },
-          world: { weather: row[25], atmosphere: row[26], tone: row[27] }
-        })).setMimeType(ContentService.MimeType.JSON);
-      }
-    }
-    return ContentService.createTextOutput(JSON.stringify({ message: "Empty" })).setMimeType(ContentService.MimeType.JSON);
-  }
-  
-  if (action === "updateStatus") {
-    const row = Number(p.rowIndex);
-    const status = p.status;
-    if (row && status) {
-      sheet.getRange(row, 30).setValue(status);
-      SpreadsheetApp.flush();
-      return ContentService.createTextOutput("Status Updated: " + status).setMimeType(ContentService.MimeType.TEXT);
-    }
-  }
-
-  // Handle updateResults in doGet as well (as fallback)
-  if (action === "updateResults") {
-    return handleUpdateResults(sheet, p);
-  }
-
-  return ContentService.createTextOutput("Action unknown").setMimeType(ContentService.MimeType.TEXT);
-}
-
-function doPost(e) {
-  const p = e.parameter;
-  const action = p.action;
-  const sheetName = "Story";
-  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(sheetName);
-  if (!sheet) return ContentService.createTextOutput("Error: Sheet not found");
-
-  if (action === "updateResults") {
-    return handleUpdateResults(sheet, p);
-  }
-  return ContentService.createTextOutput("POST Action unknown: " + action).setMimeType(ContentService.MimeType.TEXT);
-}
-
-function handleUpdateResults(sheet, p) {
-  const row = Number(p.rowIndex);
-  if (!row) return ContentService.createTextOutput("Error: No RowIndex");
-  
-  sheet.getRange(row, 30).setValue("Finished"); // Column AD
-  sheet.getRange(row, 33).setValue(p.fullPrompt || ""); // Column AG
-  sheet.getRange(row, 34).setValue(p.facebook || ""); // Column AH
-  sheet.getRange(row, 37).setValue(p.ytTitle || ""); // Column AK
-  sheet.getRange(row, 38).setValue(p.ytDesc || ""); // Column AL
-  sheet.getRange(row, 39).setValue(p.ytHashtags || ""); // Column AM
-  sheet.getRange(row, 40).setValue(p.tiktok || ""); // Column AN
-  SpreadsheetApp.flush();
-  return ContentService.createTextOutput("Results Updated").setMimeType(ContentService.MimeType.TEXT);
-}
-
-// INSTRUKSI PENTING:
-// 1. Paste kode ini ke Apps Script.
-// 2. Simpan project (Ctrl+S).
-// 3. Klik 'Deploy' -> 'New Deployment'.
-// 4. Pilih tipe: 'Web App'.
-// 5. Deskripsi bebas (misal: 'V5').
-// 6. Execute as: 'Me' (Saya).
-// 7. Who has access: 'Anyone' (SIAPA SAJA).
-// 8. Klik 'Deploy', lalu salin URL Web App yang muncul (ujungnya /exec).
-// 9. RE-DEPLOY SETIAP KALI UPDATE KODE! (Pilih 'New Deployment' lagi)
-// 10. Izinkan Script (Allow) saat pertama kali deploy.`;
-                    navigator.clipboard.writeText(code);
-                    setGasCopied(true);
-                    setTimeout(() => setGasCopied(false), 3000);
-                  }}
-                  className="h-10 text-[10px] border-orange-500/20 text-orange-500 hover:bg-orange-500/10 shrink-0"
-                >
-                  {gasCopied ? <Check className="w-4 h-4 mr-2" /> : <Copy className="w-4 h-4 mr-2" />}
-                  {gasCopied ? "Berhasil Disalin" : "Ambil Kode"}
-                </Button>
-              </div>
-
               {isAutopilotActive && (
                 <div className="bg-orange-600/5 border border-orange-500/20 rounded-xl p-5 space-y-4">
                   <div className="flex items-center justify-between border-b border-orange-500/10 pb-3">
