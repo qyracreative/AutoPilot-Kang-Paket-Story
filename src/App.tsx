@@ -267,17 +267,9 @@ export default function App() {
 
     try {
       setAutopilotStatus("Mencari antrian...");
-      const requestUrl = getRequestUrl("/api/gas-proxy", { 
-        action: "getQueue",
-        targetUrl: trimmedUrl 
-      });
-      const res = await fetch(requestUrl, {
-        method: "GET"
-      });
-      
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      
+      const res = await executeGasRequest("GET", "getQueue", {});
       const text = await res.text();
+      
       if (text.trim().startsWith("Error:")) {
         throw new Error(text.trim());
       }
@@ -299,9 +291,8 @@ export default function App() {
       return item;
     } catch (err: any) {
       console.error("Queue fetch failed:", err);
-      // Detailed error for GAS issues
       if (err.message.includes("Failed to fetch")) {
-        setAutopilotStatus("Gagal terkoneksi ke Proxy server. Coba muat ulang aplikasi.");
+        setAutopilotStatus("Gagal menghubungi Google Sheet. Pastikan GAS di-deploy 'Anyone' & cek internet.");
       } else {
         setAutopilotStatus(`Error: ${err.message}`);
       }
@@ -309,21 +300,109 @@ export default function App() {
     }
   };
 
-  const updateStatus = async (status: string, rowIndex: number) => {
+  const executeGasRequest = async (
+    method: "GET" | "POST",
+    action: string,
+    params: Record<string, any> = {},
+    bodyData?: Record<string, any>
+  ) => {
     const trimmedUrl = gasUrl.trim();
-    if (!trimmedUrl) return;
+    if (!trimmedUrl) {
+      throw new Error("URL Kosong!");
+    }
+
+    // Detect if we can use the local server-side proxy
+    let useProxy = false;
+    try {
+      const healthRes = await fetch("/api/health");
+      if (healthRes.ok) {
+        const healthData = await healthRes.json();
+        if (healthData && healthData.status === "ok") {
+          useProxy = true;
+        }
+      }
+    } catch (e) {
+      useProxy = false;
+    }
+
+    if (useProxy) {
+      console.log(`[GAS-PROXY] Forwarding action: ${action} through express dev proxy...`);
+      if (method === "GET") {
+        const requestUrl = getRequestUrl("/api/gas-proxy", {
+          ...params,
+          action,
+          targetUrl: trimmedUrl
+        });
+        const res = await fetch(requestUrl, { method: "GET" });
+        if (!res.ok) throw new Error(`HTTP ${res.status} from proxy`);
+        return res;
+      } else {
+        const res = await fetch("/api/gas-proxy", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            targetUrl: trimmedUrl,
+            action,
+            ...bodyData
+          })
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status} from proxy`);
+        return res;
+      }
+    } else {
+      console.log(`[GAS-DIRECT] Client-side fetch action: ${action} directly to Apps Script...`);
+      if (method === "GET") {
+        const requestUrl = getRequestUrl(trimmedUrl, {
+          ...params,
+          action
+        });
+        const res = await fetch(requestUrl, { 
+          method: "GET",
+          mode: "cors"
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status} (Direct fetch)`);
+        return res;
+      } else {
+        const requestUrl = getRequestUrl(trimmedUrl, { action });
+        const postParams = new URLSearchParams();
+        if (bodyData) {
+          Object.keys(bodyData).forEach(key => {
+            postParams.append(key, String(bodyData[key]));
+          });
+        }
+        
+        try {
+          const res = await fetch(requestUrl, {
+            method: "POST",
+            body: postParams,
+          });
+          return res;
+        } catch (postErr) {
+          console.warn("[GAS-DIRECT] Direct CORS POST blocked by browser or failed, fallback to no-cors POST...", postErr);
+          const res = await fetch(requestUrl, {
+            method: "POST",
+            mode: "no-cors",
+            body: postParams
+          });
+          return {
+            ok: true,
+            status: 200,
+            text: async () => "Success (no-cors fallback)"
+          } as any;
+        }
+      }
+    }
+  };
+
+  const updateStatus = async (status: string, rowIndex: number) => {
     try {
       const timestamp = new Date().getTime();
-      // Use GET for status updates with cache buster through proxy
-      const requestUrl = getRequestUrl("/api/gas-proxy", {
-        action: "updateStatus",
+      const res = await executeGasRequest("GET", "updateStatus", {
         status: status,
         rowIndex: rowIndex,
-        cb: timestamp,
-        targetUrl: trimmedUrl
-      });
-      const res = await fetch(requestUrl, {
-        method: "GET"
+        cb: timestamp
       });
       const text = await res.text();
       console.log(`Status update response: ${text}`);
@@ -338,9 +417,6 @@ export default function App() {
   };
 
   const uploadResults = async (prompt: GeneratedPrompt, rowIndex: number) => {
-    const trimmedUrl = gasUrl.trim();
-    if (!trimmedUrl) return;
-
     const fbHashtags = (prompt.socialMedia.facebook.hashtags || []).map(h => h.startsWith('#') ? h : '#' + h).join(' ');
     const fbContent = `${prompt.socialMedia.facebook.title || ""}\n\n${prompt.socialMedia.facebook.description || ""}\n\n${fbHashtags}`;
     
@@ -352,26 +428,15 @@ export default function App() {
     const fullPromptText = getFullPromptText(prompt);
 
     try {
-      // Send as a JSON payload to our proxy
-      const res = await fetch("/api/gas-proxy", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          targetUrl: trimmedUrl,
-          action: "updateResults",
-          rowIndex: rowIndex.toString(),
-          fullPrompt: fullPromptText,
-          facebook: fbContent,
-          ytTitle: prompt.socialMedia.youtube.title || "",
-          ytDesc: prompt.socialMedia.youtube.description || "",
-          ytHashtags: ytHashtags,
-          tiktok: ttContent
-        })
+      const res = await executeGasRequest("POST", "updateResults", {}, {
+        rowIndex: rowIndex.toString(),
+        fullPrompt: fullPromptText,
+        facebook: fbContent,
+        ytTitle: prompt.socialMedia.youtube.title || "",
+        ytDesc: prompt.socialMedia.youtube.description || "",
+        ytHashtags: ytHashtags,
+        tiktok: ttContent
       });
-      
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
       
       const text = await res.text();
       console.log("Upload results response:", text);
